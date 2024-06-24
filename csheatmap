@@ -1,0 +1,335 @@
+#!/usr/bin/perl
+
+use strict;
+use GD::Simple;
+use GD::Graph::lines;
+use Getopt::Long;
+
+use lib "/Users/nemesis/Desktop/Chimaera/lib";
+use lib "/data/datasets/Chimaera/lib";
+use Core::Mathematics;
+use Data::IO::Track;
+
+$|++;
+
+my ($j, $ref, $up, $down, $sort,
+    $vp, $hp, $pp, $fgcolor, $bgcolor,
+    $enlarge, @input, %input, %sorting, %colors);
+$j = 1;
+$up = 5;
+$down = 5;
+$enlarge = 250;
+$vp = "values";
+$hp = "heatmap";
+$pp = "plot";
+$fgcolor = "black";
+$bgcolor = "white";
+
+%colors = map {$_ => 1} GD::Simple->color_names();
+
+do {
+    
+    local $SIG{__WARN__} = sub { };
+
+    GetOptions( "r|reference=s"       => \$ref,
+                "s|sort=s"            => \$sort,
+                "u|upstream=s"        => \$up,
+                "d|downstream=s"      => \$down,
+                "e|enlarge=i"	      => \$enlarge,
+		"vp|values-prefix=s"  => \$vp,
+                "hp|heatmap-prefix=s" => \$hp,
+                "pp|plot-prefix=s"    => \$pp,
+                "fg|foreground=s"     => \$fgcolor,
+                "bg|background=s"     => \$bgcolor) or help();
+
+};
+
+$fgcolor = lc($fgcolor);
+$bgcolor = lc($bgcolor);
+
+die "\n  [!] Error: No reference BED file has been specified\n\n" unless(defined $ref);
+die "\n  [!] Error: Reference BED file doesn't exist\n\n" unless(-e $ref);
+die "\n  [!] Error: No peaks BED file has been specified\n\n" unless(@ARGV);
+for (@ARGV) { die "\n  [!] Error: Peaks BED file \"" . $_ . "\" doesn't exist\n\n" unless(-e $_); }
+die "\n  [!] Error: No CSV values output file prefix has been specified\n\n" unless(defined $vp);
+die "\n  [!] Error: No PNG HeatMap file prefix has been specified\n\n" unless(defined $hp);
+die "\n  [!] Error: No PNG Plot file prefix has been specified\n\n" unless(defined $pp);
+die "\n  [!] Error: Up/downstream values must be real\n\n" if (!isnumeric($up) || !isnumeric($down));
+die "\n  [!] Error: Up/downstream values must be integers greater than 0\n\n" if (!$up || !$down);
+die "\n  [!] Error: Exceeded maximum allowable up/downstream values (Max: 100kb)\n\n" if ($up > 100 || $down > 100);
+die "\n  [!] Error: Peak enlargement value must be an integer greater or equal to 0\n\n" if (!defined $enlarge || $enlarge < 0);
+die "\n  [!] Error: Invalid foreground color \"" . $fgcolor . "\". Please check the help for available colors\n\n" if (!exists $colors{$fgcolor});
+die "\n  [!] Error: Invalid foreground color \"" . $bgcolor . "\". Please check the help for available colors\n\n" if (!exists $colors{$bgcolor}); 
+
+my $tmpdir = "csheat-" . int(rand(time())) + int(rand(time()));
+mkdir($tmpdir);
+
+print "\n[+] Reordering BED files by chromosome and left-most coordinate...";
+
+system("sort -k 1,1 -k 2,2n \"" . $ref . "\" > " . $tmpdir . "/reference");
+
+$ref =~ m/([^\/]+)$/;
+$ref = uc($1);
+$ref =~ s/\.\w+$//;
+
+foreach my $file (@ARGV) {
+    
+    my $new = $file;    
+    $new =~ m/([^\/]+)$/; 
+    $new = $1;
+    $new =~ s/\.\w+$//;
+
+    if (exists $input{$new}) {
+        
+        $new .= "-" . $j;
+        $j++;    
+        
+    }
+    else { $input{$new} = 1; }
+    
+    system("sort -k 1,1 -k 2,2n \"" . $file . "\" > " . $tmpdir . "/" . $new);
+    push(@input, $new);
+    
+}
+
+if (defined $sort && -e $sort) {
+
+    my $i = 0;
+
+    print "\n[+] Sort file exists. Loading list...";
+    
+    open(my $fh, "<" . $sort);
+    while(<$fh>) {
+        
+        chomp();
+        $sorting{$_} = $i;
+        $i++;        
+        
+    }
+    close($fh);
+    
+}
+else {
+    
+    my $i = 0;
+    $sort = $tmpdir . "/sort.txt" unless(defined $sort);
+    
+    print "\n[+] No sort file provided. Sorting by " . $input[0] . " BED file...";    
+    
+    intersectbed($input[0]);
+    
+    print "\n[+] Writing sort file...";
+
+    open(my $fh, ">" . $sort) or die "\n\n  [!] Unable to write sorting file ($!)\n\n";    
+    foreach my $key (sort {$sorting{$b} <=> $sorting{$a}} keys %sorting) {
+    
+        $sorting{$key} = $i;
+        print $fh $key . "\n";
+        $i++;        
+    
+    }
+    close($fh); 
+    
+}
+
+foreach my $input (@input) {
+    
+    print "\n[+] Generating heatmap and plot data for " . $input . "...";
+    intersectbed($input, 1);
+    
+}
+
+system("rm -R " . $tmpdir);
+
+print "\n\n[+] All done.\n\n";
+
+sub intersectbed {
+    
+    my ($chipseq, $output) = @_;
+    
+    my ($tssio, $chipio, $tcont, $ccont,
+        $genes, $img, $current, $y);
+    $tssio = Data::IO::Track->new(file=>$tmpdir . "/reference");
+    $chipio = Data::IO::Track->new(file=>$tmpdir . "/" . $chipseq);
+    $tcont = $tssio->read();
+    $ccont = $chipio->read();
+    $genes = $tcont->count(); 
+    
+    if ($output) {
+        
+        $img = GD::Simple -> new((1 + $up*100 + $down*100), $genes);
+        $img->bgcolor($bgcolor);
+        $img->fgcolor($bgcolor);
+        $img->rectangle(0, 0, (1 + $up*100 + $down*100), $genes);
+        $img->fgcolor($fgcolor);
+        $y = [];
+    
+    }    
+        
+    while (my $ttrack = $tcont->read()) {
+        
+        if (!defined $ttrack->name()) {
+            
+            system("rm -R " . $tmpdir);            
+            die "\n  [!] Reference track missing name field. Unable to sort.\n\n";           
+            
+        }
+    
+        my $middle = int(($ttrack->start() + $ttrack->end()) / 2);
+        
+	if ($ttrack->strand() eq "+") {
+	
+	    next if ($middle - $up*1000 < 0);
+
+	    $ttrack->start($middle - $up*1000);
+	    $ttrack->end($middle + $down*1000);
+	    
+	}
+	else {
+	    
+	    $ttrack->start($middle - $down*1000);
+	    $ttrack->end($middle + $up*1000);
+	    
+	}
+	
+        if ($output) { $current = $sorting{$ttrack->name()}; }
+        else { $sorting{$ttrack->name()} = 0 unless(exists $sorting{$ttrack->name()}); }
+            
+        while (my $ctrack = $ccont->read()) {
+   
+            my $length = $ctrack->end() - $ctrack->start() + 1;
+   
+            if ($enlarge) {
+            
+                $ctrack->start($ctrack->start() - $enlarge);
+                $ctrack->end($ctrack->end() + $enlarge);
+    
+            }
+   
+            if ($ctrack->chromosome() gt $ttrack->chromosome() ||
+                ($ctrack->chromosome() eq $ttrack->chromosome() &&
+                 $ctrack->start() > $ttrack->end())) {
+                
+                $ccont->back(1);
+                last;
+                
+            }
+            elsif ($ctrack->chromosome() lt $ttrack->chromosome()) { next; }
+    
+            if (my $int = $ttrack->intersect($ctrack)) {
+                
+                my ($start, $end);
+                
+                next if (!$ttrack->inrange($ctrack->start()) ||
+                         !$ttrack->inrange($ctrack->end()));
+            
+                $start = ($ttrack->inrange($int->start()) ? $int->start() : $ttrack->start());
+                $end = ($ttrack->inrange($int->end()) ? $int->end() : $ttrack->end()) - $start + 1;
+                $start -= $ttrack->start();
+                $end += $start;
+            
+                if ($ttrack->strand() eq "-") {
+                
+                    my $tmp = $start;
+                    $start = (1+$down*1000+$up*1000) - $end;
+                    $end = (1+$down*1000+$up*1000) - $tmp;
+                
+                }
+                
+                if ($output) {
+                
+                    $y->[$_]++ for ($start .. $end);
+                    $img -> line(int($start/10), $current, int($end/10), $current);
+
+                }
+                else { $sorting{$ttrack->name()}++ for ($start .. $end); }
+                
+            }
+                
+        }
+        
+    }
+    
+    if ($output) {    
+    
+        my $plot = GD::Graph::lines->new();    
+        $plot->set( x_label => 'Distance from ' . $ref . ' (bp)',
+                    y_label => 'Number of peaks',
+                    
+                    x_min_value => -($up*1000),
+                    x_max_value => $down*1000,
+                    
+                    long_ticks => 0,
+                    tick_length => -4,
+                    
+                    y_min_value => 0,
+                    y_tick_number => 8,
+                    y_label_skip => 4,
+        
+                    x_tick_number => 2,
+                    x_label_skip => 2,
+        
+                    box_axis => 0,
+                    line_width => 2,
+                    x_label_position => 1/2,
+                    r_margin => 15,
+        
+                    x_labels_vertical => 1,
+        
+                    transparent => 0,
+                    interlaced => 0);
+        
+        
+        open(my $png, ">" . $pp . "-" . $chipseq . ".png");
+        binmode $png;
+        print $png $plot->plot([[-($up*1000) .. +($down*1000)], $y])->png();
+        close $png;
+        
+        open($png, ">" . $hp . "-" . $chipseq . ".png");
+        binmode $png;
+        print $png $img->png();
+        close $png;
+        
+        open(my $fh, ">" . $vp . "-" . $chipseq . ".csv");
+        print $fh "x;y\n";
+        print $fh $_ . ";" . $y->[$_] . "\n" for (0 .. ($down+$up)*1000);
+        close($fh);
+    
+    }
+
+}
+
+sub help {
+    
+    my $colors = join(", ", GD::Simple->color_names());    
+
+    die <<HELP;
+ 
+ CSHEATMAP (v0.1)
+ Epigenetics Units @ HuGeF [Human Genetics Foundation]
+ Group leader: Prof. Salvatore Oliviero
+    
+ Author:  Dr. Danny Incarnato (danny.incarnato[at]hugef-torino.org)
+ Summary: Plots ChIP-Seq peaks and other BED data, with respect to a
+          providen list of features (TSS, Peaks, etc.)
+ 
+ Usage:   csheatmap -r tss.bed [Options] peaks1.bed peaks2.bed peaksn.bed
+ 
+ Options                                 Description
+ -r  or --reference                      Reference TSS (or peaks) file
+ -s  or --sorting                        Ordered list of TSS names to use for heatmap ordering
+ -u  or --upstream                       Kilobases upstream of reference (Default: 5)
+ -d  or --downstream                     Kilobases downstream of reference (Default: 5)
+ -e  or --enlarge			 Number of bases to enlarge the peak upstream/downstream (Default: 250)
+ -fg or --foreground                     Foreground color of heatmap
+ -bg or --background                     Background color of heatmap
+ -vp or --values-prefix                  Output CSV file of plot's values prefix (Default: values)
+ -hp or --heatmap-prefix                 Output HeatMap file prefix (Default: heatmap)
+ -pp or --plot-prefix                    Output Plot prefix (Default: plot)
+ 
+Available heatmap colors:
+$colors
+ 
+HELP
+    
+}

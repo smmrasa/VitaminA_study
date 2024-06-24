@@ -1,0 +1,174 @@
+#!/usr/bin/perl
+
+##
+# SAMMERGE (v0.1)
+# Epigenetics Unit @ HuGeF [Human Genetics Foundation]
+#
+# Author:  Dr. Danny Incarnato (danny.incarnato[at]hugef-torino.org)
+# Summary: Prepares SAM file for peak calling
+##
+
+use strict;
+use Getopt::Long;
+
+$|++;
+
+my ($output, $file, $extend, $sorted,
+    $keepdup, $ldup, $lchr, $lstart,
+    $avoid, $madetmp);
+
+$extend = 150;
+$sorted = 0;
+$madetmp = 0;
+$keepdup = 1;
+
+do {
+    
+    local $SIG{__WARN__} = sub { };
+
+    GetOptions( "a|avoid-sorting"   => \$avoid,
+                "k|keep-dup=i"      => \$keepdup,
+                "e|extend=i"        => \$extend,
+                "o|output=s"        => \$output ) or help();
+
+    $file = $ARGV[0];
+
+};
+
+die "\n  [!] Error: No SAM file has been specified\n\n" unless(defined $file);
+die "\n  [!] Error: Input SAM file doesn't exist\n\n" unless(-e $file);
+
+if (!defined $output) {
+    
+    $output = $file;
+    $output =~ s/\.sam$//;
+    $output .= "_merged.sam";
+    
+}
+
+my $tmp = "/data/tmp/" . int(rand(time())) . "_tmp.sam";
+
+if ($extend) {
+
+    print "\n[+] Extending reads...";
+
+    open(my $fh, "<" . $file) or die "\n  [!] Error: Unable to open input SAM file ($!)\n\n";
+    open(my $wh, ">" . $tmp) or die "\n  [!] Error: Unable to write temporary SAM file ($!)\n\n";
+    
+    select((select($wh), $|=1)[0]);
+    
+    while(<$fh>) {
+    
+        chomp($_);
+        my @line = split(/\t/, $_);
+    	
+	print $wh $_ . "\n" if ($_ =~ m/^\@/);
+        next if (@line < 12);
+    
+        if ($line[1] & 16) {
+        
+            $line[3] -= ($extend - length($line[9]));
+            $line[5] = ($extend - length($line[9])) . "M" . $line[5];
+            $line[9] = ("N" x ($extend - length($line[9]))) . $line[9];
+            $line[10] = ("I" x ($extend - length($line[10]))) . $line[10]; 
+        
+        }
+        else {
+            
+            $line[5] .= ($extend - length($line[9])) . "M";
+            $line[9] .= ("N" x ($extend - length($line[9])));
+            $line[10] .= ("I" x ($extend - length($line[10])));
+            
+        }
+	
+	next if ($line[3] < 0);        
+        print $wh join("\t", @line) . "\n";
+    
+    }
+    
+    close($wh);
+    close($fh);
+
+}
+else { $tmp = $file; }
+
+if (!$avoid ||
+    $extend) {
+
+    print "\n[+] Sorting SAM file...";
+        
+    my $tmpsorted = "/data/tmp/" . int(rand(time())) . "_tmp.sam";
+    system("sort -k 3,3 -k 4,4n -T /data/tmp \"" . $tmp . "\" > " . $tmpsorted);  
+    unlink($tmp) if ($extend);
+    $tmp = $tmpsorted;
+    $sorted = 1;
+
+}
+else { print "\n[+] Skipping SAM file sorting..."; }
+
+print "\n[+] Merging reads...";
+
+open(my $fh, "<" . $tmp) or die "\n  [!] Error: Unable to open temporary input SAM file ($!)\n\n";
+open(my $wh, ">" . $output) or die "\n  [!] Error: Unable to write to output SAM file ($!)\n\n";
+
+select((select($wh), $|=1)[0]);
+
+while(<$fh>) {
+
+    chomp($_);
+    my @line = split(/\t/, $_);
+
+    print $wh $_ . "\n" if ($_ =~ m/^\@/);
+    next if (@line < 12);
+
+    if (defined $lchr &&
+        defined $lstart &&
+        defined $ldup &&
+        $lchr eq $line[2] &&
+        $lstart == $line[3] &&
+        $ldup >= $keepdup) { next; }
+    else {
+        
+        $ldup = 0 if ($lchr ne $line[2] ||
+                      $lstart != $line[3]);
+        $lchr = $line[2];
+        $lstart = $line[3];
+        
+        print $wh join("\t", @line) . "\n";
+
+        $ldup++;
+
+    }
+
+}
+
+close($wh);
+close($fh);
+
+unlink($tmp) if ($extend ||
+                 $sorted);
+
+print "\n[+] All done.\n\n";
+
+sub help {
+    
+    die <<HELP;
+ 
+ SamMerge (v0.1)
+ Epigenetics Units @ HuGeF [Human Genetics Foundation]
+ Group leader: Prof. Salvatore Oliviero
+    
+ Author:  Dr. Danny Incarnato (danny.incarnato[at]hugef-torino.org)
+ Summary: Prepares SAM file for peak calling
+ 
+ Usage:   sammerge [Options] mapped.sam
+ 
+ Options                                Description
+ -a  or --avoid-sorting                 Skips SAM file sorting (assume file is already sorted)
+ -e  or --extend                        Extend reads through 3'-end by n bp (Default: 150)
+ -k  or --keep-dup                      Keeps at most n duplicate reads (Default: 0)
+ -o  or --output                        Output file (Default: <mapped>_merged.sam)
+ 
+HELP
+    
+}
